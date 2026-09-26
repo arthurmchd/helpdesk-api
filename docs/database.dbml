@@ -1,0 +1,192 @@
+// ============================================================
+// Helpdesk API - modelo de dados (fase 1)
+// Cole este arquivo em https://dbdiagram.io para ver o diagrama.
+//
+// Convenções:
+//  - Chaves primárias: UUID v7 (PostgreSQL 18: uuidv7())
+//  - Datas: sempre timestamptz
+//  - Listas fixas amarradas ao código (role, status, event_type):
+//    varchar + CHECK na migration (aqui documentadas em "note")
+//  - Nada é apagado: usuários, departamentos, categorias e prioridades
+//    são desativados (is_active). As FKs usam o padrão do Postgres
+//    (NO ACTION), que bloqueia DELETE de registros referenciados.
+// ============================================================
+
+Project helpdesk_api {
+  database_type: 'PostgreSQL'
+  Note: 'Sistema de tickets / help desk'
+}
+
+// ---------- Pessoas e organização ----------
+
+Table users {
+  id uuid [pk, default: `uuidv7()`]
+  email varchar(255) [not null, note: 'Login. Salvo em minúsculas pelo código + índice único em lower(email)']
+  full_name varchar(150) [not null]
+  password_hash varchar(255) [not null, note: 'Hash Argon2. A senha em texto nunca chega ao banco']
+  role varchar(20) [not null, default: 'customer', note: 'CHECK: admin | agent | customer. Padrão = menor privilégio']
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (`lower(email)`) [unique, name: 'uq_users_email_lower']
+  }
+}
+
+Table departments {
+  id uuid [pk, default: `uuidv7()`]
+  name varchar(100) [not null, unique]
+  description text
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table department_members {
+  department_id uuid [not null, ref: > departments.id]
+  user_id uuid [not null, ref: > users.id, note: 'Somente agent/admin: regra validada no código']
+  is_lead boolean [not null, default: false, note: 'Supervisor do departamento']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (department_id, user_id) [pk]
+    user_id [name: 'ix_department_members_user']
+  }
+}
+
+// ---------- Classificação ----------
+
+Table priorities {
+  id uuid [pk, default: `uuidv7()`]
+  name varchar(50) [not null, unique]
+  level smallint [not null, unique, note: 'Maior = mais urgente. O código usa level, nunca name']
+  first_response_minutes integer [not null, note: 'SLA de primeira resposta. CHECK > 0']
+  resolution_minutes integer [not null, note: 'SLA de resolução. CHECK >= first_response_minutes']
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table categories {
+  id uuid [pk, default: `uuidv7()`]
+  department_id uuid [not null, ref: > departments.id, note: 'Roteamento automático: o ticket desta categoria nasce neste departamento']
+  name varchar(100) [not null]
+  description text
+  is_active boolean [not null, default: true]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (department_id, name) [unique, name: 'uq_categories_department_name']
+  }
+}
+
+// ---------- Tickets ----------
+
+Table tickets {
+  id uuid [pk, default: `uuidv7()`]
+  number bigint [not null, unique, increment, note: 'Número de exibição (HD-1042). Nunca usado para dar acesso']
+  title varchar(200) [not null]
+  description text [not null]
+  status varchar(30) [not null, default: 'new', note: 'CHECK: new | in_progress | waiting_customer | resolved | closed | reopened']
+
+  requester_id uuid [not null, ref: > users.id, note: 'Cliente que abriu o ticket']
+  assignee_id uuid [ref: > users.id, note: 'Atendente responsável. Nulo = na fila, sem dono']
+  department_id uuid [not null, ref: > departments.id, note: 'Copiado da categoria na criação; muda na transferência']
+  category_id uuid [not null, ref: > categories.id]
+  priority_id uuid [not null, ref: > priorities.id]
+
+  // SLA: prazos calculados na criação a partir da prioridade
+  first_response_due_at timestamptz [not null]
+  resolution_due_at timestamptz [not null]
+  first_responded_at timestamptz [note: 'Primeiro comentário público de um atendente']
+  sla_paused_at timestamptz [note: 'Preenchido enquanto status = waiting_customer. Ao retomar, os prazos avançam o tempo pausado']
+
+  resolved_at timestamptz
+  closed_at timestamptz
+
+  version integer [not null, default: 1, note: 'Concorrência otimista: UPDATE ... WHERE id = :id AND version = :versao_lida']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (requester_id, created_at) [name: 'ix_tickets_requester']
+    (assignee_id, status) [name: 'ix_tickets_assignee_status']
+    (department_id, status) [name: 'ix_tickets_department_status']
+  }
+}
+
+Table ticket_comments {
+  id uuid [pk, default: `uuidv7()`]
+  ticket_id uuid [not null, ref: > tickets.id]
+  author_id uuid [not null, ref: > users.id]
+  body text [not null]
+  is_internal boolean [not null, note: 'Sem default de propósito: o código sempre decide. true = só agent/admin veem']
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (ticket_id, created_at) [name: 'ix_ticket_comments_ticket']
+    (id, ticket_id) [unique, name: 'uq_ticket_comments_id_ticket', note: 'Alvo da FK composta dos anexos']
+  }
+}
+
+Table ticket_attachments {
+  id uuid [pk, default: `uuidv7()`]
+  ticket_id uuid [not null, ref: > tickets.id]
+  comment_id uuid [note: 'Nulo = anexado na abertura do ticket']
+  uploaded_by_id uuid [not null, ref: > users.id]
+  original_filename varchar(255) [not null, note: 'Somente para exibir e para o download']
+  storage_key varchar(500) [not null, unique, note: 'Caminho no MinIO/S3, gerado pelo sistema, nunca a partir do nome enviado']
+  content_type varchar(100) [not null]
+  size_bytes bigint [not null, note: 'CHECK > 0']
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Imutável: trocar um arquivo = novo anexo'
+
+  indexes {
+    ticket_id [name: 'ix_ticket_attachments_ticket']
+    comment_id [name: 'ix_ticket_attachments_comment']
+  }
+}
+
+// FK composta: garante no banco que o anexo de um comentário pertence ao MESMO
+// ticket do comentário. Com comment_id nulo a FK não é verificada (MATCH SIMPLE).
+Ref: ticket_attachments.(comment_id, ticket_id) > ticket_comments.(id, ticket_id)
+
+Table ticket_events {
+  id uuid [pk, default: `uuidv7()`]
+  ticket_id uuid [not null, ref: > tickets.id]
+  actor_id uuid [ref: > users.id, note: 'Nulo = ação do sistema (ex.: worker de SLA)']
+  event_type varchar(50) [not null, note: 'CHECK: created | status_changed | assigned | priority_changed | department_changed | category_changed | comment_added | attachment_added | sla_warning | sla_breached']
+  payload jsonb [not null, default: '{}', note: 'Ex.: {"from": "new", "to": "in_progress"}']
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Somente INSERT. Na migration: trigger que bloqueia UPDATE e DELETE'
+
+  indexes {
+    (ticket_id, created_at) [name: 'ix_ticket_events_ticket']
+  }
+}
+
+// ---------- Grupos (só para organizar o diagrama) ----------
+
+TableGroup people {
+  users
+  departments
+  department_members
+}
+
+TableGroup classification {
+  priorities
+  categories
+}
+
+TableGroup ticketing {
+  tickets
+  ticket_comments
+  ticket_attachments
+  ticket_events
+}
