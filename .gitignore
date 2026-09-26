@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Ferramentas
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Segredos: nunca versionar
+.env
+
+# Editores / sistema operacional
+.idea/
+.DS_Store
+Thumbs.db
